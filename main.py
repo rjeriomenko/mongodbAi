@@ -128,16 +128,6 @@ async def main():
         print("mcp-agent repo summary:")
         print(readme_summary)
 
-        webpage_summary = await run_agent(
-            agent_name="web_helper",
-            prompt="Please summarize the first few paragraphs of https://modelcontextprotocol.io/docs/getting-started/intro.",
-            app_ctx=agent_app.context,
-        )
-        print("Webpage summary:")
-        print(webpage_summary)
-
-        # UNCOMMENT to run this MCPApp as an MCP server
-        #########################################################
         # Create the MCP server that exposes both workflows and agent configurations,
         # optionally using custom FastMCP settings
         from mcp_agent.server.app_server import create_mcp_server_for_app
