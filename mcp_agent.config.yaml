@@ -34,8 +34,11 @@ mcp:
     fetch:
       command: uvx
       args: ["mcp-server-fetch"]
-      #env:  # Environment variables passed to the stdio server
-      #  ROOT_PATH: "/workspace"
+
+    # MongoDB server (connection string env var comes from secrets.yaml)
+    mongodb:
+      command: npx
+      args: ["-y", "mongodb-mcp-server"]
 
     # sse_server:
     #   transport: "sse"
@@ -62,6 +65,9 @@ agents:
     - name: web_helper
       instruction: "You can fetch web pages and summarize their content."
       server_names: [fetch]
+    - name: mongo_helper
+      instruction: "You can query and modify MongoDB databases. Use the available tools to list databases, collections, find documents, insert documents, and more."
+      server_names: [mongodb]
 
 # Model provider defaults (API keys go in mcp_agent.secrets.yaml)
 #openai:

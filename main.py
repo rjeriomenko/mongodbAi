@@ -16,10 +16,6 @@ from __future__ import annotations
 
 import asyncio
 from typing import Optional
-from pathlib import Path
-
-import yaml
-from motor.motor_asyncio import AsyncIOMotorClient
 
 from mcp_agent.app import MCPApp
 from mcp_agent.agents.agent import Agent
@@ -38,62 +34,33 @@ app = MCPApp(
 )
 
 
-# Helper to load MongoDB connection string from secrets
-def get_mongo_connection_string() -> str:
-    secrets_path = Path(__file__).parent / "mcp_agent.secrets.yaml"
-    with open(secrets_path) as f:
-        secrets = yaml.safe_load(f)
-    return secrets["mongodb"]["connection_string"]
-
-
-# MongoDB agent: store and retrieve documents
+# MongoDB agent: LLM-powered agent that uses MongoDB MCP server
 @app.tool()
-async def mongo_agent(action: str = "test", app_ctx: Optional[AppContext] = None) -> str:
+async def mongo_agent(request: str, app_ctx: Optional[AppContext] = None) -> str:
     """
-    Store and retrieve documents from MongoDB.
+    Run an LLM-powered agent that can query and modify MongoDB using natural language.
 
     Args:
-        action: "store" to save hello world, "retrieve" to get it back, "test" to do both
+        request: Natural language request like "insert a document with hello: hello world"
     """
     logger = app_ctx.app.logger
-    logger.info(f"mongo_agent called with action: {action}")
+    logger.info(f"mongo_agent called with request: {request}")
 
-    # Connect to MongoDB
-    connection_string = get_mongo_connection_string()
-    client = AsyncIOMotorClient(connection_string)
-    db = client["mongodbai"]
-    collection = db["test"]
+    agent = Agent(
+        name="mongo",
+        instruction=(
+            "You are a MongoDB assistant. Use the available MongoDB tools to help the user. "
+            "When inserting documents, use the test collection in the mongodbai database unless specified otherwise. "
+            "Always confirm what action you took and show the results."
+        ),
+        server_names=["mongodb"],
+        context=app_ctx,
+    )
 
-    result = ""
-
-    try:
-        if action in ["store", "test"]:
-            # Store document
-            doc = {"hello": "hello world"}
-            insert_result = await collection.insert_one(doc)
-            result += f"Stored document with id: {insert_result.inserted_id}\n"
-            logger.info(f"Stored document: {insert_result.inserted_id}")
-
-        if action in ["retrieve", "test"]:
-            # Retrieve document
-            found = await collection.find_one({"hello": "hello world"})
-            if found:
-                result += f"Retrieved: {found}"
-                logger.info(f"Retrieved document: {found}")
-            else:
-                result += "No document found"
-                logger.info("No document found")
-
-        if action == "remove":
-            # Delete doc
-            found = await collection.find_one({"hello": "hello world"})
-            if found:
-                await collection.delete_one({"hello": "hello world"})
-
-    finally:
-        client.close()
-
-    return result
+    async with agent:
+        llm = await agent.attach_llm(GoogleAugmentedLLM)
+        result = await llm.generate_str(message=request)
+        return result
 
 
 # Run a configured agent by name (defined in mcp_agent.config.yaml)
@@ -148,13 +115,13 @@ async def run_agent(
 
 async def main():
     async with app.run() as agent_app:
-        # Test MongoDB agent
-        mongo_result = await mongo_agent(
-            action="test",
-            app_ctx=agent_app.context,
-        )
-        print("MongoDB test result:")
-        print(mongo_result)
+        # Test MongoDB agent with natural language
+        # mongo_result = await mongo_agent(
+        #     request="List all collections in the mongodbai database",
+        #     app_ctx=agent_app.context,
+        # )
+        # print("MongoDB test result:")
+        # print(mongo_result)
 
         # Create the MCP server that exposes both workflows and agent configurations,
         # optionally using custom FastMCP settings
@@ -177,5 +144,3 @@ if __name__ == "__main__":
 # https://github.com/lastmile-ai/mcp-agent/tree/main/examples
 # and read the docs (or ask an mcp-agent to do it for you):
 # https://docs.mcp-agent.com/
-#
-# Happy mcp-agenting!
