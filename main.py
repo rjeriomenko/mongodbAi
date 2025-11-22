@@ -16,6 +16,13 @@ from __future__ import annotations
 
 import asyncio
 from typing import Optional
+from pathlib import Path
+from datetime import datetime
+
+import yaml
+from tavily import TavilyClient
+from motor.motor_asyncio import AsyncIOMotorClient
+from google import genai
 
 from mcp_agent.app import MCPApp
 from mcp_agent.agents.agent import Agent
@@ -25,6 +32,32 @@ from mcp_agent.workflows.factory import create_agent
 
 # We are using the Google Gemini augmented LLM
 from mcp_agent.workflows.llm.augmented_llm_google import GoogleAugmentedLLM
+
+
+# Load secrets
+def load_secrets():
+    secrets_path = Path(__file__).parent / "mcp_agent.secrets.yaml"
+    with open(secrets_path) as f:
+        return yaml.safe_load(f)
+
+
+# Get embedding from Google
+async def get_embedding(text: str) -> list[float]:
+    secrets = load_secrets()
+    client = genai.Client(api_key=secrets["google"]["api_key"])
+    result = await asyncio.to_thread(
+        client.models.embed_content,
+        model="text-embedding-004",
+        contents=text
+    )
+    return result.embeddings[0].values
+
+
+# Get MongoDB client
+def get_mongo_client():
+    secrets = load_secrets()
+    connection_string = secrets["mcp"]["servers"]["mongodb"]["env"]["MDB_MCP_CONNECTION_STRING"]
+    return AsyncIOMotorClient(connection_string)
 
 # Create the MCPApp, the root of mcp-agent.
 app = MCPApp(
@@ -61,6 +94,115 @@ async def mongo_agent(request: str, app_ctx: Optional[AppContext] = None) -> str
         llm = await agent.attach_llm(GoogleAugmentedLLM)
         result = await llm.generate_str(message=request)
         return result
+
+
+# RAG agent: Tavily + Embeddings + MongoDB Vector Search
+@app.tool()
+async def rag_agent(
+    query: str,
+    action: str = "query",
+    app_ctx: Optional[AppContext] = None
+) -> str:
+    """
+    RAG pipeline using Tavily for fresh data, embeddings, and MongoDB vector search.
+
+    Args:
+        query: The search query or question
+        action: "ingest" to fetch and store data, "query" to search and answer
+    """
+    logger = app_ctx.app.logger
+    logger.info(f"rag_agent called with action: {action}, query: {query}")
+
+    secrets = load_secrets()
+    mongo_client = get_mongo_client()
+    db = mongo_client["mongodbai"]
+    collection = db["test"]
+
+    try:
+        if action == "ingest":
+            # Fetch fresh data from Tavily
+            tavily_client = TavilyClient(secrets["tavily"]["api_key"])
+            response = tavily_client.search(query=query, max_results=5)
+
+            ingested = 0
+            for result in response["results"]:
+                # Generate embedding for the content
+                content = f"{result['title']}\n{result['content']}"
+                embedding = await get_embedding(content)
+
+                # Store in MongoDB
+                doc = {
+                    "url": result["url"],
+                    "title": result["title"],
+                    "content": result["content"],
+                    "score": result["score"],
+                    "embedding": embedding,
+                    "query": query,
+                    "created_at": datetime.utcnow()
+                }
+                await collection.insert_one(doc)
+                ingested += 1
+
+            return f"Ingested {ingested} documents from Tavily for query: '{query}'"
+
+        elif action == "query":
+            # Generate embedding for the query
+            query_embedding = await get_embedding(query)
+
+            # Vector search in MongoDB
+            pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": "vector_index",
+                        "path": "embedding",
+                        "queryVector": query_embedding,
+                        "numCandidates": 100,
+                        "limit": 5
+                    }
+                },
+                {
+                    "$project": {
+                        "title": 1,
+                        "content": 1,
+                        "url": 1,
+                        "score": {"$meta": "vectorSearchScore"}
+                    }
+                }
+            ]
+
+            results = await collection.aggregate(pipeline).to_list(length=5)
+
+            if not results:
+                return "No relevant documents found. Try ingesting data first with action='ingest'"
+
+            # Build context from results
+            context = "\n\n".join([
+                f"**{r['title']}** (score: {r.get('score', 'N/A'):.3f})\n{r['content']}\nSource: {r['url']}"
+                for r in results
+            ])
+
+            # Use LLM to generate response based on context
+            agent = Agent(
+                name="rag_responder",
+                instruction=(
+                    "You are a helpful assistant. Use the provided context to answer the user's question. "
+                    "Be concise and cite sources when possible."
+                ),
+                server_names=[],
+                context=app_ctx,
+            )
+
+            async with agent:
+                llm = await agent.attach_llm(GoogleAugmentedLLM)
+                prompt = f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer based on the context above:"
+                result = await llm.generate_str(message=prompt)
+                return result
+
+        else:
+            return f"Unknown action: {action}. Use 'ingest' or 'query'"
+
+    finally:
+        mongo_client.close()
 
 
 # Run a configured agent by name (defined in mcp_agent.config.yaml)
@@ -115,20 +257,28 @@ async def run_agent(
 
 async def main():
     async with app.run() as agent_app:
-        # Test MongoDB agent with natural language
-        # mongo_result = await mongo_agent(
-        #     request="List all collections in the mongodbai database",
+        # Test RAG agent - first ingest some data
+        # print("Ingesting data from Tavily...")
+        # ingest_result = await rag_agent(
+        #     query="latest fashion trends 2024",
+        #     action="ingest",
         #     app_ctx=agent_app.context,
         # )
-        # print("MongoDB test result:")
-        # print(mongo_result)
+        # print(ingest_result)
 
-        # Create the MCP server that exposes both workflows and agent configurations,
-        # optionally using custom FastMCP settings
+        # Then query with vector search
+        print("\nQuerying with vector search...")
+        query_result = await rag_agent(
+            query="What are the main fashion trends?",
+            action="query",
+            app_ctx=agent_app.context,
+        )
+        print("RAG Query Result:")
+        print(query_result)
+
+        # Uncomment to run as MCP server:
         from mcp_agent.server.app_server import create_mcp_server_for_app
         mcp_server = create_mcp_server_for_app(agent_app)
-
-        # Run the server
         await mcp_server.run_sse_async()
 
 
