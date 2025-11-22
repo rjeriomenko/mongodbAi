@@ -6,4 +6,5 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "mcp-agent[google]>=0.2.5",
+    "motor>=3.7.1",
 ]
