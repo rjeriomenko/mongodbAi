@@ -140,11 +140,11 @@ async def main():
         #########################################################
         # Create the MCP server that exposes both workflows and agent configurations,
         # optionally using custom FastMCP settings
-        # from mcp_agent.server.app_server import create_mcp_server_for_app
-        # mcp_server = create_mcp_server_for_app(agent_app)
+        from mcp_agent.server.app_server import create_mcp_server_for_app
+        mcp_server = create_mcp_server_for_app(agent_app)
 
-        # # Run the server
-        # await mcp_server.run_sse_async()
+        # Run the server
+        await mcp_server.run_sse_async()
 
 
 if __name__ == "__main__":
