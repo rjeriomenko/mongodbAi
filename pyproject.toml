@@ -7,5 +7,6 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp-agent[google]>=0.2.5",
     "motor>=3.7.1",
+    "python-dotenv>=1.2.1",
     "tavily-python>=0.7.13",
 ]

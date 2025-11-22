@@ -4,6 +4,12 @@ $schema: https://raw.githubusercontent.com/lastmile-ai/mcp-agent/refs/heads/main
 
 name: hello_world_agent
 
+# Environment variables to deploy (read from shell during mcp-agent deploy)
+env:
+  - GOOGLE_API_KEY
+  - TAVILY_API_KEY
+  - MDB_MCP_CONNECTION_STRING
+
 # Execution engine: asyncio or temporal
 # For temporal mode, see: https://github.com/lastmile-ai/mcp-agent/blob/main/examples/temporal/README.md
 execution_engine: asyncio

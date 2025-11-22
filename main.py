@@ -1,50 +1,38 @@
-"""
-Welcome to mcp-agent! We believe MCP is all you need to build and deploy agents.
-This is a canonical getting-started example that covers everything you need to know to get started.
-
-We will cover:
-  - Hello world agent: Setting up a basic Agent that uses the fetch and filesystem MCP servers to do cool stuff.
-  - @app.tool and @app.async_tool decorators to expose your agents as long-running tools on an MCP server.
-  - Advanced MCP features: Notifications, sampling, and elicitation
-
-You can run this example locally using "uv run main.py", and also deploy it as an MCP server using "mcp-agent deploy".
-
-Let's get started!
-"""
-
 from __future__ import annotations
 
 import asyncio
 from typing import Optional
-from pathlib import Path
 from datetime import datetime
 
-import yaml
+import os
+from dotenv import load_dotenv
 from tavily import TavilyClient
 from motor.motor_asyncio import AsyncIOMotorClient
 from google import genai
 
+# Load .env file
+load_dotenv()
+
 from mcp_agent.app import MCPApp
 from mcp_agent.agents.agent import Agent
 from mcp_agent.agents.agent_spec import AgentSpec
-from mcp_agent.core.context import Context as AppContext
+from mcp_agent.core.context import Context
 from mcp_agent.workflows.factory import create_agent
 
 # We are using the Google Gemini augmented LLM
 from mcp_agent.workflows.llm.augmented_llm_google import GoogleAugmentedLLM
 
 
-# Load secrets
-def load_secrets():
-    secrets_path = Path(__file__).parent / "mcp_agent.secrets.yaml"
-    with open(secrets_path) as f:
-        return yaml.safe_load(f)
-
+# Helper to get required env var
+def get_env(key: str) -> str:
+    value = os.environ.get(key, "")
+    if not value:
+        raise ValueError(f"Missing required environment variable: {key}")
+    return value
 
 # Get embedding from Google
 async def get_embedding(text: str) -> list[float]:
-    secrets = load_secrets()
-    client = genai.Client(api_key=secrets["google"]["api_key"])
+    client = genai.Client(api_key=get_env("GOOGLE_API_KEY"))
     result = await asyncio.to_thread(
         client.models.embed_content,
         model="text-embedding-004",
@@ -52,12 +40,11 @@ async def get_embedding(text: str) -> list[float]:
     )
     return result.embeddings[0].values
 
-
-# Get MongoDB client
 def get_mongo_client():
-    secrets = load_secrets()
-    connection_string = secrets["mcp"]["servers"]["mongodb"]["env"]["MDB_MCP_CONNECTION_STRING"]
-    return AsyncIOMotorClient(connection_string)
+    return AsyncIOMotorClient(get_env("MDB_MCP_CONNECTION_STRING"))
+
+def get_tavily_client():
+    return TavilyClient(get_env("TAVILY_API_KEY"))
 
 # Create the MCPApp, the root of mcp-agent.
 app = MCPApp(
@@ -66,10 +53,9 @@ app = MCPApp(
     # settings= <specify programmatically if needed; by default, configuration is read from mcp_agent.config.yaml/mcp_agent.secrets.yaml>
 )
 
-
 # MongoDB agent: LLM-powered agent that uses MongoDB MCP server
 @app.tool()
-async def mongo_agent(request: str, app_ctx: Optional[AppContext] = None) -> str:
+async def mongo_agent(request: str, app_ctx: Optional[Context] = None) -> str:
     """
     Run an LLM-powered agent that can query and modify MongoDB using natural language.
 
@@ -101,7 +87,7 @@ async def mongo_agent(request: str, app_ctx: Optional[AppContext] = None) -> str
 async def rag_agent(
     query: str,
     action: str = "query",
-    app_ctx: Optional[AppContext] = None
+    app_ctx: Optional[Context] = None
 ) -> str:
     """
     RAG pipeline using Tavily for fresh data, embeddings, and MongoDB vector search.
@@ -113,22 +99,24 @@ async def rag_agent(
     logger = app_ctx.app.logger
     logger.info(f"rag_agent called with action: {action}, query: {query}")
 
-    secrets = load_secrets()
-    mongo_client = get_mongo_client()
-    db = mongo_client["mongodbai"]
-    collection = db["test"]
+    try:
+        mongo_client = get_mongo_client()
+        db = mongo_client["mongodbai"]
+        collection = db["test"]
+    except Exception as e:
+        logger.error(f"Failed to connect to MongoDB: {e}")
+        return f"Error: Failed to connect to MongoDB - {e}"
 
     try:
         if action == "ingest":
             # Fetch fresh data from Tavily
-            tavily_client = TavilyClient(secrets["tavily"]["api_key"])
+            tavily_client = get_tavily_client()
             response = tavily_client.search(query=query, max_results=5)
 
             ingested = 0
             for result in response["results"]:
                 # Generate embedding for the content
                 content = f"{result['title']}\n{result['content']}"
-                embedding = await get_embedding(content)
 
                 # Store in MongoDB
                 doc = {
@@ -136,7 +124,7 @@ async def rag_agent(
                     "title": result["title"],
                     "content": result["content"],
                     "score": result["score"],
-                    "embedding": embedding,
+                    "embedding": await get_embedding(content),
                     "query": query,
                     "created_at": datetime.utcnow()
                 }
@@ -147,7 +135,12 @@ async def rag_agent(
 
         elif action == "query":
             # Generate embedding for the query
-            query_embedding = await get_embedding(query)
+            try:
+                query_embedding = await get_embedding(query)
+                logger.info(f"Generated embedding with {len(query_embedding)} dimensions")
+            except Exception as e:
+                logger.error(f"Failed to generate embedding: {e}")
+                return f"Error: Failed to generate embedding - {e}"
 
             # Vector search in MongoDB
             pipeline = [
@@ -170,7 +163,12 @@ async def rag_agent(
                 }
             ]
 
-            results = await collection.aggregate(pipeline).to_list(length=5)
+            try:
+                results = await collection.aggregate(pipeline).to_list(length=5)
+                logger.info(f"Vector search returned {len(results)} results")
+            except Exception as e:
+                logger.error(f"Vector search failed: {e}")
+                return f"Error: Vector search failed - {e}. Make sure 'vector_index' exists on the collection."
 
             if not results:
                 return "No relevant documents found. Try ingesting data first with action='ingest'"
@@ -210,7 +208,7 @@ async def rag_agent(
 async def run_agent(
     agent_name: str = "web_helper",
     prompt: str = "Please summarize the first paragraph of https://modelcontextprotocol.io/docs/getting-started/intro",
-    app_ctx: Optional[AppContext] = None,
+    app_ctx: Optional[Context] = None,
 ) -> str:
     """
     Load an agent defined in mcp_agent.config.yaml by name and run it.
