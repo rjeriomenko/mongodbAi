@@ -878,6 +878,7 @@ name = "mongodbai"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "mcp-agent", extra = ["google"] },
     { name = "motor" },
     { name = "python-dotenv" },
@@ -886,6 +887,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.13.2" },
     { name = "mcp-agent", extras = ["google"], specifier = ">=0.2.5" },
     { name = "motor", specifier = ">=3.7.1" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
