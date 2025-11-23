@@ -24,6 +24,8 @@ class Job(TypedDict, total=False):
     location: str | None
     tags: list[str]
     source: str
+    score: float
+    is_fresh: bool
 
 # Load .env file
 load_dotenv()
@@ -196,8 +198,9 @@ async def career_agent(
     """
     start_time = time.time()
     tools_executed = []
-    jobs_fresh = []
+    matched_jobs = []
     docs_created = 0
+    historical_matches = 0
 
     # Build dict of selected tools based on flags (dict enforces uniqueness)
     selected_tools = {}
@@ -264,34 +267,61 @@ async def career_agent(
                     bulk_result = await collection.bulk_write(operations)
                     docs_created += bulk_result.upserted_count
 
+                # Track URLs we just fetched
+                fresh_urls = [job.get("url") for job in result["results"]]
+
                 # Vector search to find matching jobs
                 query_embedding = await get_embedding(query)
-                pipeline = [
+
+                project_stage = {
+                    "$project": {
+                        "title": 1,
+                        "company": 1,
+                        "url": 1,
+                        "salary": 1,
+                        "location": 1,
+                        "tags": 1,
+                        "source": 1,
+                        "score": {"$meta": "vectorSearchScore"}
+                    }
+                }
+
+                # Vector search for FRESH jobs (from current fetch)
+                fresh_pipeline = [
                     {
                         "$vectorSearch": {
                             "index": "vector_index",
                             "path": "embedding",
                             "queryVector": query_embedding,
                             "numCandidates": 100,
-                            "limit": max_results
+                            "limit": max_results // 2,
+                            "filter": {"url": {"$in": fresh_urls}}
                         }
                     },
-                    {
-                        "$project": {
-                            "title": 1,
-                            "company": 1,
-                            "url": 1,
-                            "salary": 1,
-                            "location": 1,
-                            "tags": 1,
-                            "source": 1,
-                            "score": {"$meta": "vectorSearchScore"}
-                        }
-                    }
+                    project_stage
                 ]
 
-                matched_jobs = await collection.aggregate(pipeline).to_list(length=max_results)
-                jobs_fresh.extend(matched_jobs)
+                # Vector search for HISTORICAL jobs (exclude current fetch)
+                historical_pipeline = [
+                    {
+                        "$vectorSearch": {
+                            "index": "vector_index",
+                            "path": "embedding",
+                            "queryVector": query_embedding,
+                            "numCandidates": 100,
+                            "limit": max_results // 2,
+                            "filter": {"url": {"$nin": fresh_urls}}
+                        }
+                    },
+                    project_stage
+                ]
+
+                # Run both searches and mark with is_fresh
+                fresh_jobs = [dict(job, is_fresh=True) for job in await collection.aggregate(fresh_pipeline).to_list(length=max_results // 2)]
+                historical_jobs = [dict(job, is_fresh=False) for job in await collection.aggregate(historical_pipeline).to_list(length=max_results // 2)]
+
+                matched_jobs.extend(fresh_jobs)
+                matched_jobs.extend(historical_jobs)
 
                 mongo_client.close()
 
@@ -300,16 +330,11 @@ async def career_agent(
     return {
         "query": query,
         "tools_executed": tools_executed,
-        "jobs": {
-            "fresh": jobs_fresh,
-            "recommended": [],
-            "count": len(jobs_fresh)
-        },
-        "communities": {"forums": []},
+        "jobs": matched_jobs,
         "metadata": {
             "execution_time_ms": execution_time,
-            "fresh_matches": len(jobs_fresh),
-            "historical_matches": 0,
+            "fresh_matches": len(fresh_jobs),
+            "historical_matches": len(historical_jobs),
             "database_documents_created": docs_created
         }
     }
@@ -317,26 +342,27 @@ async def career_agent(
 async def main():
     async with app.run() as agent_app:
         result = await career_agent(
-            query="chief designer remote",
+            query="ruby",
             app_ctx=agent_app.context,
         )
 
         # Print test results
         print(f"\nQuery: {result['query']}")
         print(f"Tools: {result['tools_executed']}")
-        print(f"Jobs found: {result['jobs']['count']}")
+        print(f"Jobs found: {len(result['jobs'])}")
+        print(f"Fresh: {result['metadata']['fresh_matches']}, Historical: {result['metadata']['historical_matches']}")
         print(f"Docs created: {result['metadata']['database_documents_created']}")
         print(f"Time: {result['metadata']['execution_time_ms']}ms\n")
 
-        for i, job in enumerate(result["jobs"]["fresh"]):
-            print(f"Job {i+1}: {job.get('title', 'N/A')}")
+        for i, job in enumerate(result["jobs"]):
+            fresh_tag = "[FRESH]" if job.get('is_fresh') else "[HISTORICAL]"
+            print(f"Job {i+1} {fresh_tag}: {job.get('title', 'N/A')}")
             if job.get('company'):
                 print(f"  Company: {job.get('company')}")
             if job.get('salary'):
                 print(f"  Salary: {job.get('salary')}")
-            print(f"  URL: {job.get('url', 'N/A')}")
-            print(f"  Score: {job.get('score', 0)}")
-            print(f"  Source: {job.get('source', 'N/A')}\n")
+            print(f"  Score: {job.get('score', 0):.4f}")
+            print(f"  URL: {job.get('url', 'N/A')}\n")
 
 if __name__ == "__main__":
     asyncio.run(main())
