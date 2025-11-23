@@ -48,39 +48,9 @@ def get_tavily_client():
 
 # Create the MCPApp, the root of mcp-agent.
 app = MCPApp(
-    name="hello_world",
-    description="Hello world mcp-agent application",
-    # settings= <specify programmatically if needed; by default, configuration is read from mcp_agent.config.yaml/mcp_agent.secrets.yaml>
+    name="career_agent",
+    description="Career search agent with jobs, communities, and personalized recommendations",
 )
-
-# MongoDB agent: LLM-powered agent that uses MongoDB MCP server
-@app.tool()
-async def mongo_agent(request: str, app_ctx: Optional[Context] = None) -> str:
-    """
-    Run an LLM-powered agent that can query and modify MongoDB using natural language.
-
-    Args:
-        request: Natural language request like "insert a document with hello: hello world"
-    """
-    logger = app_ctx.app.logger
-    logger.info(f"mongo_agent called with request: {request}")
-
-    agent = Agent(
-        name="mongo",
-        instruction=(
-            "You are a MongoDB assistant. Use the available MongoDB tools to help the user. "
-            "When inserting documents, use the test collection in the mongodbai database unless specified otherwise. "
-            "Always confirm what action you took and show the results."
-        ),
-        server_names=["mongodb"],
-        context=app_ctx,
-    )
-
-    async with agent:
-        llm = await agent.attach_llm(GoogleAugmentedLLM)
-        result = await llm.generate_str(message=request)
-        return result
-
 
 # RAG agent: Tavily + Embeddings + MongoDB Vector Search
 @app.tool()
@@ -201,6 +171,44 @@ async def rag_agent(
 
     finally:
         mongo_client.close()
+
+
+# Career Agent: Main mega-tool for job search
+@app.tool()
+async def career_agent(
+    query: str,
+    include_jobs: bool = True,
+    include_communities: bool = True,
+    max_results: int = 20,
+    user_id: str = "anonymous",
+    app_ctx: Optional[Context] = None
+) -> dict:
+    """
+    Career search agent that finds jobs, communities, and relevant resources.
+
+    Args:
+        query: Search query (e.g., "python developer remote")
+        include_jobs: Include job listings
+        include_communities: Include community/forum results
+        max_results: Maximum total results to return
+        user_id: User identifier for personalization
+    """
+    logger = app_ctx.app.logger
+    logger.info(f"career_agent called: query={query}, user={user_id}")
+
+    # Placeholder response - will build out in next steps
+    return {
+        "query": query,
+        "tools_executed": [],
+        "jobs": {"fresh": [], "recommended": [], "count": 0},
+        "communities": {"forums": []},
+        "metadata": {
+            "execution_time_ms": 0,
+            "fresh_matches": 0,
+            "historical_matches": 0,
+            "database_documents_created": 0
+        }
+    }
 
 
 # Run a configured agent by name (defined in mcp_agent.config.yaml)

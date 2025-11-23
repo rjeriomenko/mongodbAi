@@ -2,7 +2,7 @@
 # Config definition: https://github.com/lastmile-ai/mcp-agent/blob/main/src/mcp_agent/config.py
 $schema: https://raw.githubusercontent.com/lastmile-ai/mcp-agent/refs/heads/main/schema/mcp-agent.config.schema.json
 
-name: hello_world_agent
+name: career_agent
 
 # Environment variables to deploy (read from shell during mcp-agent deploy)
 env:
@@ -76,9 +76,6 @@ agents:
       server_names: [mongodb]
 
 # Model provider defaults (API keys go in mcp_agent.secrets.yaml)
-#openai:
-#  default_model: gpt-4o-mini
-
 #anthropic:
 #  default_model: claude-sonnet-4-0
 google:
