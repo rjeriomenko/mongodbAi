@@ -57,7 +57,7 @@ async def search_jobs_tavily(query: str) -> dict:
                 client.search,
                 query=search_query,
                 search_depth=depth,
-                max_results=5,
+                max_results=20,
                 include_raw_content=False,
                 include_images=False,
             ),
@@ -225,6 +225,7 @@ async def career_agent(
     start_time = time.time()
     tools_executed = []
     jobs_fresh = []
+    docs_created = 0
 
     # Search for jobs if requested
     if include_jobs:
@@ -232,6 +233,31 @@ async def career_agent(
         tools_executed.append(jobs_result["source"])
         if not jobs_result["error"]:
             jobs_fresh = jobs_result["results"]
+
+            # Store results in MongoDB with embeddings
+            mongo_client = get_mongo_client()
+            db = mongo_client["mongodbai"]
+            collection = db["career_results"]
+
+            for job in jobs_fresh:
+                content = f"{job.get('title', '')}\n{job.get('content', '')}"
+                embedding = await get_embedding(content)
+
+                doc = {
+                    "query": query,
+                    "source": jobs_result["source"],
+                    "url": job.get("url"),
+                    "title": job.get("title"),
+                    "content": job.get("content"),
+                    "score": job.get("score"),
+                    "embedding": embedding,
+                    "user_id": user_id,
+                    "created_at": datetime.utcnow()
+                }
+                await collection.insert_one(doc)
+                docs_created += 1
+
+            mongo_client.close()
 
     execution_time = int((time.time() - start_time) * 1000)
 
@@ -248,7 +274,7 @@ async def career_agent(
             "execution_time_ms": execution_time,
             "fresh_matches": len(jobs_fresh),
             "historical_matches": 0,
-            "database_documents_created": 0
+            "database_documents_created": docs_created
         }
     }
 
@@ -263,6 +289,7 @@ async def main():
         print(f"\nQuery: {result['query']}")
         print(f"Tools: {result['tools_executed']}")
         print(f"Jobs found: {result['jobs']['count']}")
+        print(f"Docs created: {result['metadata']['database_documents_created']}")
         print(f"Time: {result['metadata']['execution_time_ms']}ms\n")
 
         for i, job in enumerate(result["jobs"]["fresh"]):
