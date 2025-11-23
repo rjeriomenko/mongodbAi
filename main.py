@@ -206,6 +206,7 @@ async def rag_agent(
 @app.tool()
 async def career_agent(
     query: str,
+    run_tavily: bool = False,
     include_jobs: bool = True,
     include_communities: bool = True,
     max_results: int = 20,
@@ -227,37 +228,53 @@ async def career_agent(
     jobs_fresh = []
     docs_created = 0
 
-    # Search for jobs if requested
-    if include_jobs:
-        jobs_result = await search_jobs_tavily(query)
-        tools_executed.append(jobs_result["source"])
-        if not jobs_result["error"]:
-            jobs_fresh = jobs_result["results"]
+    # Build dict of selected tools based on flags (dict enforces uniqueness)
+    selected_tools = {}
+    if include_jobs and run_tavily:
+        selected_tools["search_jobs_tavily"] = search_jobs_tavily(query)
 
-            # Store results in MongoDB with embeddings
-            mongo_client = get_mongo_client()
-            db = mongo_client["mongodbai"]
-            collection = db["career_results"]
+    # Execute all selected tools in parallel
+    if selected_tools:
+        tool_names = list(selected_tools.keys())
+        tool_coros = list(selected_tools.values())
+        results = await asyncio.gather(*tool_coros, return_exceptions=True)
 
-            for job in jobs_fresh:
-                content = f"{job.get('title', '')}\n{job.get('content', '')}"
-                embedding = await get_embedding(content)
+        # Process results
+        for i, result in enumerate(results):
+            tool_name = tool_names[i]
+            tools_executed.append(tool_name)
 
-                doc = {
-                    "query": query,
-                    "source": jobs_result["source"],
-                    "url": job.get("url"),
-                    "title": job.get("title"),
-                    "content": job.get("content"),
-                    "score": job.get("score"),
-                    "embedding": embedding,
-                    "user_id": user_id,
-                    "created_at": datetime.utcnow()
-                }
-                await collection.insert_one(doc)
-                docs_created += 1
+            if isinstance(result, Exception):
+                continue
 
-            mongo_client.close()
+            # Handle search_jobs_tavily results
+            if tool_name == "search_jobs_tavily" and not result.get("error"):
+                jobs_fresh = result["results"]
+
+                # Store results in MongoDB with embeddings
+                mongo_client = get_mongo_client()
+                db = mongo_client["mongodbai"]
+                collection = db["career_results"]
+
+                for job in jobs_fresh:
+                    content = f"{job.get('title', '')}\n{job.get('content', '')}"
+                    embedding = await get_embedding(content)
+
+                    doc = {
+                        "query": query,
+                        "source": result["source"],
+                        "url": job.get("url"),
+                        "title": job.get("title"),
+                        "content": job.get("content"),
+                        "score": job.get("score"),
+                        "embedding": embedding,
+                        "user_id": user_id,
+                        "created_at": datetime.utcnow()
+                    }
+                    await collection.insert_one(doc)
+                    docs_created += 1
+
+                mongo_client.close()
 
     execution_time = int((time.time() - start_time) * 1000)
 
