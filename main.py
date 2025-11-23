@@ -7,6 +7,7 @@ from datetime import datetime
 
 import os
 import aiohttp
+from urllib.parse import quote
 from dotenv import load_dotenv
 from tavily import TavilyClient
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -65,12 +66,13 @@ async def generate_search_terms(query: str) -> list[str]:
     """Use LLM to extract good search terms from a natural language query."""
     client = genai.Client(api_key=get_env("GOOGLE_API_KEY"))
 
-    prompt = f"""Extract search terms from this job query. Return only lowercase keywords separated by commas, no explanations.
-Focus on: job titles, programming languages, frameworks, skills, experience levels.
+    prompt = f"""Convert this job search query into tags for RemoteOK's API. Return only lowercase single-word tags separated by commas, no explanations.
+The first tag should be the most important/specific one (e.g., a programming language, job title, or skill).
+Focus on: programming languages, frameworks, job titles, skills.
 
 Query: "{query}"
 
-Terms:"""
+Tags:"""
 
     result = await asyncio.to_thread(
         client.models.generate_content,
@@ -88,8 +90,13 @@ Terms:"""
 async def search_remoteok_jobs(query: str, max_results: int = 20) -> dict:
     """Fetch job listings from RemoteOK API."""
     try:
+        # Use LLM to generate optimized search term
+        search_terms = await generate_search_terms(query)
+        search_query = search_terms[0] if search_terms else query
+
         async with aiohttp.ClientSession() as session:
-            url = f"https://remoteok.com/api?limit={max_results}"
+            encoded_query = quote(search_query)
+            url = f"https://remoteok.com/api?tag={encoded_query}&limit={max_results}"
             headers = {"User-Agent": "CareerAgent/1.0"}
 
             async with session.get(url, headers=headers) as response:
@@ -301,27 +308,48 @@ async def career_agent(
                     project_stage
                 ]
 
-                # Vector search for HISTORICAL jobs (exclude current fetch)
-                historical_pipeline = [
-                    {
-                        "$vectorSearch": {
-                            "index": "vector_index",
-                            "path": "embedding",
-                            "queryVector": query_embedding,
-                            "numCandidates": 100,
-                            "limit": max_results // 2,
-                            "filter": {"url": {"$nin": fresh_urls}}
-                        }
-                    },
-                    project_stage
-                ]
-
                 # Run both searches and mark with is_fresh
-                fresh_jobs = [dict(job, is_fresh=True) for job in await collection.aggregate(fresh_pipeline).to_list(length=max_results // 2)]
-                historical_jobs = [dict(job, is_fresh=False) for job in await collection.aggregate(historical_pipeline).to_list(length=max_results // 2)]
+                if fresh_urls:
+                    # Vector search for FRESH jobs
+                    fresh_jobs = [dict(job, is_fresh=True) for job in await collection.aggregate(fresh_pipeline).to_list(length=max_results // 2)]
+
+                    # Vector search for HISTORICAL jobs (exclude current fetch)
+                    historical_pipeline = [
+                        {
+                            "$vectorSearch": {
+                                "index": "vector_index",
+                                "path": "embedding",
+                                "queryVector": query_embedding,
+                                "numCandidates": 100,
+                                "limit": max_results // 2,
+                                "filter": {"url": {"$nin": fresh_urls}}
+                            }
+                        },
+                        project_stage
+                    ]
+                    historical_jobs = [dict(job, is_fresh=False) for job in await collection.aggregate(historical_pipeline).to_list(length=max_results // 2)]
+                else:
+                    # No fresh jobs - search all historical (no filter needed)
+                    fresh_jobs = []
+                    historical_pipeline = [
+                        {
+                            "$vectorSearch": {
+                                "index": "vector_index",
+                                "path": "embedding",
+                                "queryVector": query_embedding,
+                                "numCandidates": 100,
+                                "limit": max_results
+                            }
+                        },
+                        project_stage
+                    ]
+                    historical_jobs = [dict(job, is_fresh=False) for job in await collection.aggregate(historical_pipeline).to_list(length=max_results)]
 
                 matched_jobs.extend(fresh_jobs)
                 matched_jobs.extend(historical_jobs)
+
+                # Sort all jobs by score descending
+                matched_jobs.sort(key=lambda x: x.get('score', 0), reverse=True)
 
                 mongo_client.close()
 
@@ -342,7 +370,7 @@ async def career_agent(
 async def main():
     async with app.run() as agent_app:
         result = await career_agent(
-            query="ruby",
+            query="ceo",
             app_ctx=agent_app.context,
         )
 
