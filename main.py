@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+import time
+from typing import Optional, Literal
 from datetime import datetime
 
 import os
@@ -41,6 +42,39 @@ def get_mongo_client():
 
 def get_tavily_client():
     return TavilyClient(get_env("TAVILY_API_KEY"))
+
+
+# Internal tool: Search jobs via Tavily
+async def search_jobs_tavily(query: str) -> dict:
+    """Search for job listings using Tavily."""
+    try:
+        client = get_tavily_client()
+        search_query = f"{query} job listings careers hiring"
+        depth: Literal["basic", "advanced"] = "basic"
+
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.search,
+                query=search_query,
+                search_depth=depth,
+                max_results=5,
+                include_raw_content=False,
+                include_images=False,
+            ),
+            timeout=10.0
+        )
+
+        return {
+            "source": search_jobs_tavily.__name__,
+            "results": response.get("results", []),
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "source": search_jobs_tavily.__name__,
+            "results": [],
+            "error": str(e)
+        }
 
 # Create the MCPApp, the root of mcp-agent.
 app = MCPApp(
@@ -188,18 +222,31 @@ async def career_agent(
         max_results: Maximum total results to return
         user_id: User identifier for personalization
     """
-    logger = app_ctx.app.logger
-    logger.info(f"career_agent called: query={query}, user={user_id}")
+    start_time = time.time()
+    tools_executed = []
+    jobs_fresh = []
 
-    # Placeholder response - will build out in next steps
+    # Search for jobs if requested
+    if include_jobs:
+        jobs_result = await search_jobs_tavily(query)
+        tools_executed.append(jobs_result["source"])
+        if not jobs_result["error"]:
+            jobs_fresh = jobs_result["results"]
+
+    execution_time = int((time.time() - start_time) * 1000)
+
     return {
         "query": query,
-        "tools_executed": [],
-        "jobs": {"fresh": [], "recommended": [], "count": 0},
+        "tools_executed": tools_executed,
+        "jobs": {
+            "fresh": jobs_fresh,
+            "recommended": [],
+            "count": len(jobs_fresh)
+        },
         "communities": {"forums": []},
         "metadata": {
-            "execution_time_ms": 0,
-            "fresh_matches": 0,
+            "execution_time_ms": execution_time,
+            "fresh_matches": len(jobs_fresh),
             "historical_matches": 0,
             "database_documents_created": 0
         }
@@ -207,15 +254,21 @@ async def career_agent(
 
 async def main():
     async with app.run() as agent_app:
-        # Test career_agent
-        print("\nTesting career_agent...")
         result = await career_agent(
             query="python developer remote",
             app_ctx=agent_app.context,
         )
-        print("Career Agent Result:")
-        print(result)
 
+        # Print test results
+        print(f"\nQuery: {result['query']}")
+        print(f"Tools: {result['tools_executed']}")
+        print(f"Jobs found: {result['jobs']['count']}")
+        print(f"Time: {result['metadata']['execution_time_ms']}ms\n")
+
+        for i, job in enumerate(result["jobs"]["fresh"]):
+            print(f"Job {i+1}: {job.get('title', 'N/A')}")
+            print(f"  URL: {job.get('url', 'N/A')}")
+            print(f"  Score: {job.get('score', 0)}\n")
 
 if __name__ == "__main__":
     asyncio.run(main())
