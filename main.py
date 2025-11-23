@@ -15,11 +15,7 @@ load_dotenv()
 
 from mcp_agent.app import MCPApp
 from mcp_agent.agents.agent import Agent
-from mcp_agent.agents.agent_spec import AgentSpec
 from mcp_agent.core.context import Context
-from mcp_agent.workflows.factory import create_agent
-
-# We are using the Google Gemini augmented LLM
 from mcp_agent.workflows.llm.augmented_llm_google import GoogleAugmentedLLM
 
 
@@ -172,7 +168,6 @@ async def rag_agent(
     finally:
         mongo_client.close()
 
-
 # Career Agent: Main mega-tool for job search
 @app.tool()
 async def career_agent(
@@ -210,93 +205,20 @@ async def career_agent(
         }
     }
 
-
-# Run a configured agent by name (defined in mcp_agent.config.yaml)
-@app.async_tool(name="run_agent_async")
-async def run_agent(
-    agent_name: str = "web_helper",
-    prompt: str = "Please summarize the first paragraph of https://modelcontextprotocol.io/docs/getting-started/intro",
-    app_ctx: Optional[Context] = None,
-) -> str:
-    """
-    Load an agent defined in mcp_agent.config.yaml by name and run it.
-
-    Notes:
-    - @app.async_tool:
-      - async version of @app.tool -- returns a workflow ID back (can be used with workflows-get_status tool)
-      - runs the function as a long-running workflow tool when deployed as an MCP server
-      - no-op when running this locally as a script
-    """
-
-    logger = app_ctx.app.logger
-
-    agent_definitions = (
-        app.config.agents.definitions
-        if app is not None
-        and app.config is not None
-        and app.config.agents is not None
-        and app.config.agents.definitions is not None
-        else []
-    )
-
-    agent_spec: AgentSpec | None = None
-    for agent_def in agent_definitions:
-        if agent_def.name == agent_name:
-            agent_spec = agent_def
-            break
-
-    if agent_spec is None:
-        logger.error("Agent not found", data={"name": agent_name})
-        return f"agent '{agent_name}' not found"
-
-    logger.info(
-        "Agent found in spec",
-        data={"name": agent_name, "instruction": agent_spec.instruction},
-    )
-
-    agent = create_agent(agent_spec, context=app_ctx)
-
-    async with agent:
-        llm = await agent.attach_llm(GoogleAugmentedLLM)
-        return await llm.generate_str(message=prompt)
-
-
 async def main():
     async with app.run() as agent_app:
-        # Test RAG agent - first ingest some data
-        # print("Ingesting data from Tavily...")
-        # ingest_result = await rag_agent(
-        #     query="latest fashion trends 2024",
-        #     action="ingest",
-        #     app_ctx=agent_app.context,
-        # )
-        # print(ingest_result)
-
-        # Then query with vector search
-        print("\nQuerying with vector search...")
-        query_result = await rag_agent(
-            query="What are the main fashion trends?",
-            action="query",
+        # Test career_agent
+        print("\nTesting career_agent...")
+        result = await career_agent(
+            query="python developer remote",
             app_ctx=agent_app.context,
         )
-        print("RAG Query Result:")
-        print(query_result)
-
-        # Uncomment to run as MCP server:
-        from mcp_agent.server.app_server import create_mcp_server_for_app
-        mcp_server = create_mcp_server_for_app(agent_app)
-        await mcp_server.run_sse_async()
+        print("Career Agent Result:")
+        print(result)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 
 # When you're ready to deploy this MCPApp as a remote SSE server, run:
-# > uv run mcp-agent deploy "hello_world" --no-auth
-#
-# Congrats! You made it to the end of the getting-started example!
-# There is a lot more that mcp-agent can do, and we hope you'll explore the rest of the documentation.
-# Check out other examples in the mcp-agent repo:
-# https://github.com/lastmile-ai/mcp-agent/tree/main/examples
-# and read the docs (or ask an mcp-agent to do it for you):
-# https://docs.mcp-agent.com/
+# > uv run mcp-agent deploy "career_agent" --no-auth
