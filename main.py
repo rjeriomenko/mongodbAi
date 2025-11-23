@@ -10,6 +10,7 @@ import aiohttp
 from dotenv import load_dotenv
 from tavily import TavilyClient
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import UpdateOne
 from google import genai
 
 
@@ -226,15 +227,19 @@ async def career_agent(
                 db = mongo_client["mongodbai"]
                 collection = db["career_results"]
 
-                for job in result["results"]:
-                    # Build content for embedding
+                # Generate all embeddings in parallel
+                async def embed_job(job):
                     content_parts = [job.get('title', ''), job.get('company', '')]
                     if job.get('tags'):
                         content_parts.append(' '.join(job.get('tags', [])))
                     content = '\n'.join(filter(None, content_parts))
+                    return await get_embedding(content)
 
-                    embedding = await get_embedding(content)
+                embeddings = await asyncio.gather(*[embed_job(job) for job in result["results"]])
 
+                # Build bulk upsert operations
+                operations = []
+                for job, embedding in zip(result["results"], embeddings):
                     doc = {
                         "query": query,
                         "source": result["source"],
@@ -246,10 +251,18 @@ async def career_agent(
                         "tags": job.get("tags", []),
                         "embedding": embedding,
                         "user_id": user_id,
-                        "created_at": datetime.utcnow()
+                        "updated_at": datetime.utcnow()
                     }
-                    await collection.insert_one(doc)
-                    docs_created += 1
+                    operations.append(UpdateOne(
+                        {"url": job.get("url")},
+                        {"$set": doc, "$setOnInsert": {"created_at": datetime.utcnow()}},
+                        upsert=True
+                    ))
+
+                # Execute all upserts in one batch
+                if operations:
+                    bulk_result = await collection.bulk_write(operations)
+                    docs_created += bulk_result.upserted_count
 
                 # Vector search to find matching jobs
                 query_embedding = await get_embedding(query)
@@ -304,7 +317,7 @@ async def career_agent(
 async def main():
     async with app.run() as agent_app:
         result = await career_agent(
-            query="python developer remote",
+            query="chief designer remote",
             app_ctx=agent_app.context,
         )
 
