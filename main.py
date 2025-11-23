@@ -81,15 +81,11 @@ Terms:"""
     return terms
 
 
-# Internal tool: Search jobs via RemoteOK API
+# Internal tool: Fetch jobs from RemoteOK API
 async def search_remoteok_jobs(query: str, max_results: int = 20) -> dict:
-    """Search RemoteOK API and return scored job listings."""
+    """Fetch job listings from RemoteOK API."""
     try:
-        # Generate search terms from query using LLM
-        search_terms = await generate_search_terms(query)
-
         async with aiohttp.ClientSession() as session:
-            # RemoteOK doesn't have a limit param, but we can try tags filter
             url = f"https://remoteok.com/api?limit={max_results}"
             headers = {"User-Agent": "CareerAgent/1.0"}
 
@@ -103,50 +99,30 @@ async def search_remoteok_jobs(query: str, max_results: int = 20) -> dict:
 
                 all_jobs = await response.json()
 
-                # Skip first item (metadata), limit to reduce processing
+                # Skip first item (metadata)
                 raw_jobs = all_jobs[1:max_results + 1] if len(all_jobs) > 1 else []
 
-                # Score and filter jobs based on search terms
-                scored_jobs = []
+                # Convert to standard job format
+                jobs = []
                 for job in raw_jobs:
-                    # Build searchable text
-                    searchable = f"{job.get('position', '')} {job.get('company', '')} {' '.join(job.get('tags', []))}".lower()
+                    salary = None
+                    if job.get('salary_min'):
+                        salary = f"${job.get('salary_min', 0):,}-${job.get('salary_max', 0):,}"
 
-                    # Calculate match score
-                    matches = sum(1 for term in search_terms if term in searchable)
-                    if matches > 0:
-                        score = matches / len(search_terms) if search_terms else 0
-
-                        # Build salary string
-                        salary = None
-                        if job.get('salary_min'):
-                            salary = f"${job.get('salary_min', 0):,}-${job.get('salary_max', 0):,}"
-
-                        scored_jobs.append({
-                            "title": job.get("position", ""),
-                            "company": job.get("company", ""),
-                            "url": job.get("url", ""),
-                            "salary": salary,
-                            "date_posted": job.get("date", ""),
-                            "location": job.get("location", "Worldwide"),
-                            "tags": job.get("tags", []),
-                            "source": "remoteok",
-                            "score": score
-                        })
-
-                # Sort by score and limit results
-                scored_jobs.sort(key=lambda x: x["score"], reverse=True)
-                results = scored_jobs[:max_results]
-
-                # Debug output
-                print(f"DEBUG: Search terms: {search_terms}")
-                print(f"DEBUG: Raw jobs from API: {len(raw_jobs)}")
-                print(f"DEBUG: Matched jobs: {len(scored_jobs)}")
+                    jobs.append({
+                        "title": job.get("position", ""),
+                        "company": job.get("company", ""),
+                        "url": job.get("url", ""),
+                        "salary": salary,
+                        "date_posted": job.get("date", ""),
+                        "location": job.get("location", "Worldwide"),
+                        "tags": job.get("tags", []),
+                        "source": "remoteok"
+                    })
 
                 return {
                     "source": search_remoteok_jobs.__name__,
-                    "results": results,
-                    "search_terms": search_terms,
+                    "results": jobs,
                     "error": None
                 }
 
@@ -365,8 +341,6 @@ async def career_agent(
 
             # Handle job search results (both RemoteOK and Tavily)
             if tool_name in ["search_remoteok_jobs", "search_jobs_tavily"] and not result.get("error"):
-                jobs_fresh.extend(result["results"])
-
                 # Store results in MongoDB with embeddings
                 mongo_client = get_mongo_client()
                 db = mongo_client["mongodbai"]
@@ -390,13 +364,41 @@ async def career_agent(
                         "salary": job.get("salary"),
                         "location": job.get("location"),
                         "tags": job.get("tags", []),
-                        "score": job.get("score"),
                         "embedding": embedding,
                         "user_id": user_id,
                         "created_at": datetime.utcnow()
                     }
                     await collection.insert_one(doc)
                     docs_created += 1
+
+                # Vector search to find matching jobs
+                query_embedding = await get_embedding(query)
+                pipeline = [
+                    {
+                        "$vectorSearch": {
+                            "index": "vector_index",
+                            "path": "embedding",
+                            "queryVector": query_embedding,
+                            "numCandidates": 100,
+                            "limit": max_results
+                        }
+                    },
+                    {
+                        "$project": {
+                            "title": 1,
+                            "company": 1,
+                            "url": 1,
+                            "salary": 1,
+                            "location": 1,
+                            "tags": 1,
+                            "source": 1,
+                            "score": {"$meta": "vectorSearchScore"}
+                        }
+                    }
+                ]
+
+                matched_jobs = await collection.aggregate(pipeline).to_list(length=max_results)
+                jobs_fresh.extend(matched_jobs)
 
                 mongo_client.close()
 
@@ -440,7 +442,8 @@ async def main():
             if job.get('salary'):
                 print(f"  Salary: {job.get('salary')}")
             print(f"  URL: {job.get('url', 'N/A')}")
-            print(f"  Score: {job.get('score', 0)}\n")
+            print(f"  Score: {job.get('score', 0)}")
+            print(f"  Source: {job.get('source', 'N/A')}\n")
 
 if __name__ == "__main__":
     asyncio.run(main())
