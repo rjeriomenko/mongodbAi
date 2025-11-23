@@ -1,49 +1,206 @@
 from __future__ import annotations
 
-import asyncio
 import time
-import os
-from typing import Optional
+import json
+from typing import Optional, Any, Union
+
+from mcp_agent.core.context import Context as AppContext
+from urllib.parse import quote
+from urllib.request import urlopen, Request
 from datetime import datetime
 
-from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import UpdateOne
-from google import genai
+from pymongo import MongoClient, UpdateOne
 
 from mcp_agent.app import MCPApp
-from mcp_agent.core.context import Context
+from mcp_agent.logging.logger import get_logger
+from mcp_agent.config import get_settings
 
-from models.job import Job
-from tools.jobs import search_remoteok_jobs, search_jobs_tavily
-
-
-# Load .env file
-load_dotenv()
+logger = get_logger(__name__)
 
 
-def get_env(key: str) -> str:
-    """Get required environment variable."""
-    value = os.environ.get(key, "")
-    if not value:
-        raise ValueError(f"Missing required environment variable: {key}")
-    return value
+def get_mongodb_connection_string() -> str:
+    """Get MongoDB connection string from settings."""
+    settings = get_settings()
+    if settings.mcp and settings.mcp.servers:
+        mongodb_server = settings.mcp.servers.get('mongodb')
+        if mongodb_server and hasattr(mongodb_server, 'env'):
+            conn_str = mongodb_server.env.get('MDB_MCP_CONNECTION_STRING')
+            if conn_str:
+                return conn_str
+    raise ValueError("Missing MongoDB connection string")
 
 
-async def get_embedding(text: str) -> list[float]:
-    """Get embedding from Google."""
-    client = genai.Client(api_key=get_env("GOOGLE_API_KEY"))
-    result = await asyncio.to_thread(
-        client.models.embed_content,
-        model="text-embedding-004",
-        contents=text
+def get_google_api_key() -> str:
+    """Get Google API key from settings."""
+    settings = get_settings()
+    if settings.google and settings.google.api_key:
+        return settings.google.api_key
+    raise ValueError("Missing Google API key")
+
+
+def generate_embedding_http(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
+    """Generate embedding using Gemini REST API with urllib."""
+    api_key = get_google_api_key()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}"
+
+    payload = {
+        "model": "models/text-embedding-004",
+        "content": {"parts": [{"text": text}]},
+        "taskType": task_type
+    }
+
+    req = Request(
+        url,
+        data=json.dumps(payload).encode('utf-8'),
+        headers={"Content-Type": "application/json"}
     )
-    return result.embeddings[0].values
+
+    with urlopen(req, timeout=30) as response:
+        result = json.loads(response.read().decode('utf-8'))
+        return result['embedding']['values']
 
 
-def get_mongo_client():
-    """Get MongoDB client instance."""
-    return AsyncIOMotorClient(get_env("MDB_MCP_CONNECTION_STRING"))
+def generate_embeddings(texts: list[str]) -> list[list[float]]:
+    """Generate embeddings for a list of texts using Gemini REST API."""
+    logger.info(f"generate_embeddings: generating for {len(texts)} texts")
+
+    embeddings = []
+    for i, text in enumerate(texts):
+        try:
+            embedding = generate_embedding_http(text, "RETRIEVAL_DOCUMENT")
+            embeddings.append(embedding)
+            if (i + 1) % 5 == 0:
+                logger.info(f"generate_embeddings: processed {i + 1}/{len(texts)}")
+        except Exception as e:
+            logger.error(f"generate_embeddings: error for text {i}: {e}")
+            embeddings.append([0.0] * 768)
+
+    logger.info(f"generate_embeddings: completed {len(embeddings)} embeddings")
+    return embeddings
+
+
+def generate_query_embedding(query: str) -> list[float]:
+    """Generate embedding for a search query using Gemini REST API."""
+    logger.info(f"generate_query_embedding: generating for query")
+
+    try:
+        embedding = generate_embedding_http(query, "RETRIEVAL_QUERY")
+        logger.info("generate_query_embedding: success")
+        return embedding
+    except Exception as e:
+        logger.error(f"generate_query_embedding: error: {e}")
+        return [0.0] * 768
+
+
+def vector_search_jobs(collection, query_embedding: list[float], urls: list[str], is_fresh: bool, limit: int = 10) -> list[dict]:
+    """Search for jobs using MongoDB Atlas Vector Search.
+
+    Args:
+        collection: MongoDB collection
+        query_embedding: Query vector for similarity search
+        urls: URLs to filter by
+        is_fresh: If True, search for jobs IN urls ($in). If False, search for jobs NOT IN urls ($nin).
+        limit: Max results to return
+    """
+    job_type = "fresh" if is_fresh else "historical"
+    filter_op = "$in" if is_fresh else "$nin"
+
+    logger.info(f"vector_search_jobs: searching for {limit} {job_type} jobs")
+
+    if is_fresh and not urls:
+        return []
+
+    try:
+        # Build filter
+        url_filter = {"url": {filter_op: urls}} if urls else {}
+
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_index",
+                    "path": "embedding",
+                    "queryVector": query_embedding,
+                    "numCandidates": limit * 10,
+                    "limit": limit,
+                    "filter": url_filter
+                }
+            },
+            {
+                "$project": {
+                    "_id": 0,
+                    "url": 1,
+                    "title": 1,
+                    "company": 1,
+                    "salary_min": 1,
+                    "salary_max": 1,
+                    "location": 1,
+                    "score": {"$meta": "vectorSearchScore"}
+                }
+            }
+        ]
+
+        results = list(collection.aggregate(pipeline))
+        logger.info(f"vector_search_jobs: found {len(results)} {job_type} jobs")
+
+        # Mark fresh/historical
+        for job in results:
+            job["is_fresh"] = is_fresh
+
+        return results
+
+    except Exception as e:
+        logger.error(f"vector_search_jobs: error: {e}")
+        return []
+
+
+async def search_remoteok_jobs(query: str, max_results: int = 20) -> dict:
+    """Fetch job listings from RemoteOK API."""
+    logger.info(f"search_remoteok_jobs: starting with query={query}")
+
+    try:
+        # Parse query
+        search_query = query.split()[0].lower() if query else "developer"
+        logger.info(f"search_remoteok_jobs: parsed search_query={search_query}")
+
+        # Build URL
+        encoded_query = quote(search_query)
+        url = f"https://remoteok.com/api?tag={encoded_query}&limit={max_results}"
+        logger.info(f"search_remoteok_jobs: url={url}")
+
+        # Make request
+        logger.info("search_remoteok_jobs: making HTTP request...")
+        req = Request(url, headers={"User-Agent": "CareerAgent/1.0"})
+        with urlopen(req, timeout=30) as response:
+            response_text = response.read().decode('utf-8')
+            logger.info(f"search_remoteok_jobs: got response, length={len(response_text)}")
+
+        # Parse JSON
+        logger.info("search_remoteok_jobs: parsing JSON...")
+        all_jobs = json.loads(response_text)
+        raw_jobs = all_jobs[1:max_results + 1] if len(all_jobs) > 1 else []
+        logger.info(f"search_remoteok_jobs: parsed {len(raw_jobs)} jobs")
+
+        # Build simple job list
+        jobs = []
+        for job in raw_jobs:
+            jobs.append({
+                "url": job.get("url", ""),
+                "title": job.get("position", ""),
+                "company": job.get("company", ""),
+                "salary_min": job.get("salary_min"),
+                "salary_max": job.get("salary_max"),
+                "location": job.get("location", "Worldwide"),
+            })
+
+        logger.info(f"search_remoteok_jobs: returning {len(jobs)} jobs")
+        return {"jobs": jobs, "error": None}
+
+    except Exception as e:
+        import traceback
+        error_msg = f"{type(e).__name__}: {e}"
+        logger.error(f"search_remoteok_jobs: error={error_msg}")
+        logger.error(f"search_remoteok_jobs: traceback={traceback.format_exc()}")
+        return {"jobs": [], "error": error_msg}
 
 
 # Create the MCPApp
@@ -53,7 +210,7 @@ app = MCPApp(
 )
 
 
-@app.tool()
+@app.tool
 async def career_agent(
     query: str,
     run_tavily: bool = False,
@@ -61,7 +218,7 @@ async def career_agent(
     include_communities: bool = True,
     max_results: int = 20,
     user_id: str = "anonymous",
-    app_ctx: Optional[Context] = None
+    app_ctx: Optional[AppContext] = None
 ) -> dict:
     """
     Career search agent that finds jobs, communities, and relevant resources.
@@ -73,201 +230,122 @@ async def career_agent(
         include_communities: Include community/forum results
         max_results: Maximum total results to return
         user_id: User identifier for personalization
+        app_ctx: MCP context for logging and server access
     """
     start_time = time.time()
-    tools_executed = []
-    matched_jobs: list[dict] = []
-    docs_created = 0
-    fresh_jobs: list[dict] = []
-    historical_jobs: list[dict] = []
 
-    # Build dict of selected tools
-    selected_tools = {}
-    if include_jobs:
-        selected_tools["search_remoteok_jobs"] = search_remoteok_jobs(query, max_results)
-    if include_jobs and run_tavily:
-        selected_tools["search_jobs_tavily"] = search_jobs_tavily(query)
+    if app_ctx:
+        app_ctx.logger.info("Starting career_agent", data={"query": query})
 
-    # Execute all selected tools in parallel
-    if selected_tools:
-        tool_names = list(selected_tools.keys())
-        tool_coros = list(selected_tools.values())
-        results = await asyncio.gather(*tool_coros, return_exceptions=True)
+    if app_ctx:
+        app_ctx.logger.info("Fetching jobs from RemoteOK", data={})
 
-        for i, result in enumerate(results):
-            tool_name = tool_names[i]
-            tools_executed.append(tool_name)
+    result = await search_remoteok_jobs(query, max_results)
+    fetched_jobs = result.get("jobs", [])
+    fetched_urls = [job["url"] for job in fetched_jobs]
 
-            if isinstance(result, Exception):
-                continue
+    if app_ctx:
+        app_ctx.logger.info("Fetched jobs", data={"count": len(fetched_jobs)})
 
-            if tool_name in ["search_remoteok_jobs", "search_jobs_tavily"] and not result.get("error"):
-                mongo_client = get_mongo_client()
-                db = mongo_client["mongodbai"]
-                collection = db["career_results"]
+    if result.get("error"):
+        if app_ctx:
+            app_ctx.logger.error("RemoteOK error", data={"error": result['error']})
 
-                jobs: list[Job] = result["results"]
+    if app_ctx:
+        app_ctx.logger.info("Generating query embedding", data={})
 
-                # Generate all embeddings in parallel
-                async def embed_job(job: Job) -> list[float]:
-                    content_parts = [job.title, job.company]
-                    if job.tags:
-                        content_parts.append(' '.join(job.tags))
-                    content = '\n'.join(filter(None, content_parts))
-                    return await get_embedding(content)
+    try:
+        query_embedding = generate_query_embedding(query)
+        if app_ctx:
+            app_ctx.logger.info("Query embedding generated", data={"length": len(query_embedding)})
+    except Exception as e:
+        if app_ctx:
+            app_ctx.logger.error("Query embedding failed", data={"error": str(e)})
+        raise
 
-                embeddings = await asyncio.gather(*[embed_job(job) for job in jobs])
+    docs_upserted = 0
+    historical_jobs = []
+    fresh_jobs = []
+    half_results = max_results // 2
 
-                # Build bulk upsert operations
-                operations = []
-                for job, embedding in zip(jobs, embeddings):
-                    doc = {
-                        "query": query,
-                        "source": job.source,
-                        "url": job.url,
-                        "title": job.title,
-                        "company": job.company,
-                        "salary_min": job.salary_min,
-                        "salary_max": job.salary_max,
-                        "location": job.location,
-                        "tags": job.tags,
-                        "date_posted": job.date_posted,
-                        "embedding": embedding,
-                        "user_id": user_id,
-                        "updated_at": datetime.utcnow()
-                    }
-                    operations.append(UpdateOne(
-                        {"url": job.url},
-                        {"$set": doc, "$setOnInsert": {"created_at": datetime.utcnow()}},
-                        upsert=True
-                    ))
+    try:
+        logger.info("career_agent: connecting to MongoDB")
+        conn_str = get_mongodb_connection_string()
+        mongo_client = MongoClient(conn_str)
+        db = mongo_client["mongodbai"]
+        collection = db["career_results"]
 
-                # Execute all upserts in one batch
-                if operations:
-                    bulk_result = await collection.bulk_write(operations)
-                    docs_created += bulk_result.upserted_count
+        if fetched_jobs:
+            logger.info(f"career_agent: generating embeddings for {len(fetched_jobs)} jobs")
+            job_texts = [f"{job['title']} at {job['company']} - {job.get('location', '')}" for job in fetched_jobs]
+            job_embeddings = generate_embeddings(job_texts)
 
-                # Track URLs we just fetched
-                fresh_urls = [job.url for job in jobs]
-
-                # Vector search
-                query_embedding = await get_embedding(query)
-
-                project_stage = {
-                    "$project": {
-                        "title": 1,
-                        "company": 1,
-                        "url": 1,
-                        "salary_min": 1,
-                        "salary_max": 1,
-                        "location": 1,
-                        "tags": 1,
-                        "source": 1,
-                        "date_posted": 1,
-                        "score": {"$meta": "vectorSearchScore"}
-                    }
+            operations = []
+            for job, embedding in zip(fetched_jobs, job_embeddings):
+                doc = {
+                    "query": query,
+                    "url": job["url"],
+                    "title": job["title"],
+                    "company": job["company"],
+                    "salary_min": job.get("salary_min"),
+                    "salary_max": job.get("salary_max"),
+                    "location": job.get("location"),
+                    "user_id": user_id,
+                    "embedding": embedding,
+                    "updated_at": datetime.utcnow()
                 }
+                operations.append(UpdateOne(
+                    {"url": job["url"]},
+                    {"$set": doc, "$setOnInsert": {"created_at": datetime.utcnow()}},
+                    upsert=True
+                ))
 
-                # Vector search for FRESH jobs
-                fresh_pipeline = [
-                    {
-                        "$vectorSearch": {
-                            "index": "vector_index",
-                            "path": "embedding",
-                            "queryVector": query_embedding,
-                            "numCandidates": 100,
-                            "limit": max_results // 2,
-                            "filter": {"url": {"$in": fresh_urls}}
-                        }
-                    },
-                    project_stage
-                ]
+            logger.info(f"career_agent: upserting {len(operations)} jobs to MongoDB")
+            bulk_result = collection.bulk_write(operations)
+            docs_upserted = bulk_result.upserted_count
 
-                if fresh_urls:
-                    fresh_jobs = [dict(job, is_fresh=True) for job in await collection.aggregate(fresh_pipeline).to_list(length=max_results // 2)]
+        logger.info(f"career_agent: running vector search for {half_results} results each")
+        historical_jobs = vector_search_jobs(collection, query_embedding, fetched_urls, is_fresh=False, limit=half_results)
+        fresh_jobs = vector_search_jobs(collection, query_embedding, fetched_urls, is_fresh=True, limit=half_results)
 
-                    # Vector search for HISTORICAL jobs
-                    historical_pipeline = [
-                        {
-                            "$vectorSearch": {
-                                "index": "vector_index",
-                                "path": "embedding",
-                                "queryVector": query_embedding,
-                                "numCandidates": 100,
-                                "limit": max_results // 2,
-                                "filter": {"url": {"$nin": fresh_urls}}
-                            }
-                        },
-                        project_stage
-                    ]
-                    historical_jobs = [dict(job, is_fresh=False) for job in await collection.aggregate(historical_pipeline).to_list(length=max_results // 2)]
-                else:
-                    fresh_jobs = []
-                    historical_pipeline = [
-                        {
-                            "$vectorSearch": {
-                                "index": "vector_index",
-                                "path": "embedding",
-                                "queryVector": query_embedding,
-                                "numCandidates": 100,
-                                "limit": max_results
-                            }
-                        },
-                        project_stage
-                    ]
-                    historical_jobs = [dict(job, is_fresh=False) for job in await collection.aggregate(historical_pipeline).to_list(length=max_results)]
+        mongo_client.close()
 
-                matched_jobs.extend(fresh_jobs)
-                matched_jobs.extend(historical_jobs)
+    except Exception as e:
+        import traceback
+        logger.error(f"career_agent: MongoDB/embedding error: {type(e).__name__}: {e}")
+        logger.error(f"career_agent: traceback: {traceback.format_exc()}")
 
-                # Sort all jobs by score descending
-                matched_jobs.sort(key=lambda x: x.get('score', 0), reverse=True)
+    combined_jobs = historical_jobs + fresh_jobs
+    combined_jobs.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-                mongo_client.close()
+    fresh_count = sum(1 for j in combined_jobs if j.get("is_fresh", False))
+    historical_count = len(combined_jobs) - fresh_count
 
     execution_time = int((time.time() - start_time) * 1000)
+    logger.info(f"career_agent: complete - {len(combined_jobs)} jobs ({fresh_count} fresh, {historical_count} historical) in {execution_time}ms")
 
     return {
         "query": query,
-        "tools_executed": tools_executed,
-        "jobs": matched_jobs,
-        "metadata": {
-            "execution_time_ms": execution_time,
-            "fresh_matches": len(fresh_jobs),
-            "historical_matches": len(historical_jobs),
-            "database_documents_created": docs_created
-        }
+        "jobs": combined_jobs,
+        "fresh_count": fresh_count,
+        "historical_count": historical_count,
+        "docs_upserted": docs_upserted,
+        "error": result.get("error"),
+        "execution_time_ms": execution_time
     }
 
 
 async def main():
+    import asyncio
     async with app.run() as agent_app:
         result = await career_agent(
             query="python developer",
-            app_ctx=agent_app.context,
         )
-
-        print(f"\nQuery: {result['query']}")
-        print(f"Tools: {result['tools_executed']}")
-        print(f"Jobs found: {len(result['jobs'])}")
-        print(f"Fresh: {result['metadata']['fresh_matches']}, Historical: {result['metadata']['historical_matches']}")
-        print(f"Docs created: {result['metadata']['database_documents_created']}")
-        print(f"Time: {result['metadata']['execution_time_ms']}ms\n")
-
-        for i, job in enumerate(result["jobs"]):
-            fresh_tag = "[FRESH]" if job.get('is_fresh') else "[HISTORICAL]"
-            print(f"Job {i+1} {fresh_tag}: {job.get('title', 'N/A')}")
-            if job.get('company'):
-                print(f"  Company: {job.get('company')}")
-            if job.get('salary_min') or job.get('salary_max'):
-                salary_min = job.get('salary_min', 0)
-                salary_max = job.get('salary_max', 0)
-                print(f"  Salary: ${salary_min:,}-${salary_max:,}")
-            print(f"  Score: {job.get('score', 0):.4f}")
-            print(f"  URL: {job.get('url', 'N/A')}\n")
+        print(f"Result: {json.dumps(result, indent=2, default=str)}")
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
 
 # Deploy as remote SSE server:
