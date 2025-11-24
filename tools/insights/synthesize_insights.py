@@ -35,12 +35,24 @@ async def synthesize_insights(
     job_skills = set()
     job_titles = []
     salary_ranges = []
+    company_names = []
 
     for job in response.jobs[:10]:  # Top 10 jobs
         job_titles.append(job.title)
         job_skills.update(job.tags)
         if job.salary_min and job.salary_max:
             salary_ranges.append(f"${job.salary_min:,}-${job.salary_max:,}")
+        if job.company:
+            company_names.append(job.company)
+
+    # Build context from companies (including culture)
+    company_cultures = []
+    company_titles = []
+
+    for company in response.companies[:5]:  # Top 5 companies
+        company_titles.append(company.company_title)
+        if company.culture:
+            company_cultures.append(f"- {company.company_title}: {company.culture[:300]}")
 
     # Format research results
     role_context = "\n".join([
@@ -58,26 +70,38 @@ async def synthesize_insights(
         for r in learning_resources.get("results", [])[:5]
     ])
 
-    prompt = f"""You are a career advisor analyzing job market data and providing personalized recommendations.
+    # Format company culture context
+    culture_context = "\n".join(company_cultures) if company_cultures else "No culture data available"
+
+    prompt = f"""You are a career advisor analyzing job market data, company cultures, and providing personalized recommendations.
 
 USER'S TARGET ROLE: {response.query}
 USER'S CURRENT SKILLS: {', '.join(user_context.user_skills) if user_context.user_skills else 'Not specified'}
 
 JOB MARKET DATA:
-- Job titles found: {', '.join(job_titles[:5])}
-- Skills in demand: {', '.join(list(job_skills)[:15])}
+- Job titles found: {', '.join(job_titles[:5]) if job_titles else 'None found'}
+- Companies hiring: {', '.join(company_names[:5]) if company_names else ', '.join(company_titles[:5]) if company_titles else 'Various'}
+- Skills in demand: {', '.join(list(job_skills)[:15]) if job_skills else 'See role research'}
 - Salary ranges: {', '.join(salary_ranges[:5]) if salary_ranges else 'Varies'}
 
+COMPANY CULTURES:
+{culture_context}
+
 ROLE RESEARCH:
-{role_context}
+{role_context if role_context else 'No specific role research available'}
 
 MARKET TRENDS:
-{market_context}
+{market_context if market_context else 'No specific market trends available'}
 
 LEARNING RESOURCES:
-{learning_context}
+{learning_context if learning_context else 'No specific learning resources available'}
 
-Based on this analysis, provide:
+Based on this analysis, consider:
+- What kind of jobs suit the user based on available data
+- What company cultures might be a good fit
+- What skills and experiences would help them succeed
+
+Provide:
 
 1. A brief personalized message (2-3 sentences) summarizing the user's position and key next steps.
 

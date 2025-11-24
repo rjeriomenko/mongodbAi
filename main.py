@@ -12,8 +12,12 @@ from mcp_agent.logging.logger import get_logger
 from pydantic import BaseModel
 
 from models.job import Job
+from models.company import Company
 from tools.insights import tavily_role_research, tavily_market_trends, tavily_learning_resources, synthesize_insights
 from tools.jobs.remoteok_search_jobs import remoteok_search_jobs
+from tools.companies.tavily_populate_emails import tavily_populate_emails
+from tools.companies.tavily_companies_search import tavily_companies_search
+from tools.companies.tavily_populate_culture import tavily_populate_culture
 
 logger = get_logger(__name__)
 
@@ -70,6 +74,7 @@ class ToolNames(BaseModel):
 class ToolCategories(BaseModel):
     """Tools organized by category"""
     jobs: list[str] = []
+    companies: list[str] = []
     insights: list[str] = []
 
 
@@ -102,6 +107,7 @@ class Response(BaseModel):
     query: str
     search_terms: list[str] = []
     jobs: list[Job] = []
+    companies: list[Company] = []
     metadata: Metadata = Metadata()
     insights: InsightData | None = None
     error: str | None = None
@@ -114,6 +120,7 @@ class Response(BaseModel):
 class ToolRegistry(BaseModel):
     """Registry of available tools with their functions and descriptions"""
     jobs: dict[str, tuple] = {}
+    companies: dict[str, tuple] = {}
     insights: dict[str, tuple] = {}
 
     class Config:
@@ -125,6 +132,11 @@ TOOL_REGISTRY = ToolRegistry(
     jobs={
         remoteok_search_jobs.__name__: (remoteok_search_jobs, get_func_description(remoteok_search_jobs)),
     },
+    companies={
+        tavily_companies_search.__name__: (tavily_companies_search, get_func_description(tavily_companies_search)),
+        tavily_populate_emails.__name__: (tavily_populate_emails, get_func_description(tavily_populate_emails)),
+        tavily_populate_culture.__name__: (tavily_populate_culture, get_func_description(tavily_populate_culture)),
+    },
     insights={
         tavily_role_research.__name__: (tavily_role_research, get_func_description(tavily_role_research)),
         tavily_market_trends.__name__: (tavily_market_trends, get_func_description(tavily_market_trends)),
@@ -134,24 +146,29 @@ TOOL_REGISTRY = ToolRegistry(
 )
 
 
-def get_available_tools(allow_jobs: bool, allow_insights: bool) -> ToolCategories:
+def get_available_tools(allow_jobs: bool, allow_companies: bool, allow_insights: bool) -> ToolCategories:
     """Determine which tools are available based on user preferences."""
     jobs = []
+    companies = []
     insights = []
 
     if allow_jobs:
         jobs = list(TOOL_REGISTRY.jobs.keys())
 
+    if allow_companies:
+        companies = list(TOOL_REGISTRY.companies.keys())
+
     if allow_insights:
         insights = list(TOOL_REGISTRY.insights.keys())
 
-    return ToolCategories(jobs=jobs, insights=insights)
+    return ToolCategories(jobs=jobs, companies=companies, insights=insights)
 
 
 async def choose_tools(
     query: str,
     user_context: UserContext,
     allow_jobs: bool,
+    allow_companies: bool,
     allow_insights: bool,
     app_ctx: Optional[AppContext] = None,
 ) -> ToolCategories:
@@ -159,7 +176,7 @@ async def choose_tools(
     if app_ctx:
         app_ctx.logger.info("choose_tools: analyzing query", data={"query": query})
 
-    available_tools = get_available_tools(allow_jobs, allow_insights)
+    available_tools = get_available_tools(allow_jobs, allow_companies, allow_insights)
 
     # Format available tools for the prompt using TOOL_REGISTRY
     tools_description = []
@@ -168,6 +185,12 @@ async def choose_tools(
         tools_description.append("JOBS CATEGORY TOOLS:")
         for tool_name in available_tools.jobs:
             _, description = TOOL_REGISTRY.jobs[tool_name]
+            tools_description.append(f"  - {tool_name}: {description}")
+
+    if available_tools.companies:
+        tools_description.append("COMPANIES CATEGORY TOOLS:")
+        for tool_name in available_tools.companies:
+            _, description = TOOL_REGISTRY.companies[tool_name]
             tools_description.append(f"  - {tool_name}: {description}")
 
     if available_tools.insights:
@@ -186,7 +209,7 @@ USER SKILLS: {', '.join(user_context.user_skills) if user_context.user_skills el
 AVAILABLE TOOLS:
 {tools_list}
 
-Select which tools should be executed. Return only the tool names as a list. Try to choose at least two tools per category, if possible."""
+Select which tools should be executed. Return only the tool names as a list. Try to choose at no more than five tools if the user is being vague. Try to choose up to eight tools if the user is being specific."""
 
     try:
         async with Agent(
@@ -206,14 +229,15 @@ Select which tools should be executed. Return only the tool names as a list. Try
     except Exception as e:
         logger.error(f"choose_tools: error: {e}")
         # Fallback: use all available tools
-        selected_names = available_tools.jobs + available_tools.insights
+        selected_names = available_tools.jobs + available_tools.companies + available_tools.insights
 
     # Rebuild flat list into ToolCategories
     selected_jobs = [name for name in selected_names if name in available_tools.jobs]
+    selected_companies = [name for name in selected_names if name in available_tools.companies]
     selected_insights = [name for name in selected_names if name in available_tools.insights]
 
-    result = ToolCategories(jobs=selected_jobs, insights=selected_insights)
-    logger.info(f"choose_tools: categorized into {len(result.jobs)} jobs, {len(result.insights)} insights")
+    result = ToolCategories(jobs=selected_jobs, companies=selected_companies, insights=selected_insights)
+    logger.info(f"choose_tools: categorized into {len(result.jobs)} jobs, {len(result.companies)} companies, {len(result.insights)} insights")
 
     return result
 
@@ -224,6 +248,7 @@ async def execute_tools(
     max_results: int,
     user_id: str,
     allow_jobs: bool,
+    allow_companies: bool,
     allow_insights: bool,
     response: "Response",
     app_ctx: Optional[AppContext] = None,
@@ -253,6 +278,67 @@ async def execute_tools(
                 tools_executed.append(tool_name)
                 if app_ctx:
                     app_ctx.logger.info(f"Executed {tool_name}", data={"jobs": len(response.jobs)})
+
+    # Execute companies tools (after jobs)
+    if allow_companies and tool_selection.companies:
+        companies_search_ran = False
+
+        for tool_name in tool_selection.companies:
+            if tool_name == "tavily_companies_search":
+                try:
+                    response = await tavily_companies_search(
+                        query=response.query,
+                        max_results=max_results,
+                        response=response,
+                        app_ctx=app_ctx
+                    )
+                    tools_executed.append(tool_name)
+                    companies_search_ran = True
+                    if app_ctx:
+                        app_ctx.logger.info(f"Executed {tool_name}", data={"companies": len(response.companies)})
+                except Exception as e:
+                    logger.error(f"execute_tools: error executing {tool_name}: {e}")
+
+            elif tool_name == "tavily_populate_emails":
+                try:
+                    response = await tavily_populate_emails(
+                        query=response.query,
+                        jobs=response.jobs,
+                        response=response,
+                        app_ctx=app_ctx
+                    )
+                    tools_executed.append(tool_name)
+                    if app_ctx:
+                        app_ctx.logger.info(f"Executed {tool_name}", data={"companies": len(response.companies)})
+                except Exception as e:
+                    logger.error(f"execute_tools: error executing {tool_name}: {e}")
+
+            elif tool_name == "tavily_populate_culture":
+                try:
+                    response = await tavily_populate_culture(
+                        query=response.query,
+                        response=response,
+                        app_ctx=app_ctx
+                    )
+                    tools_executed.append(tool_name)
+                    if app_ctx:
+                        app_ctx.logger.info(f"Executed {tool_name}", data={"companies": len(response.companies)})
+                except Exception as e:
+                    logger.error(f"execute_tools: error executing {tool_name}: {e}")
+
+        # If companies_search ran, automatically run culture tool if not already executed
+        if companies_search_ran and "tavily_populate_culture" not in tools_executed:
+            try:
+                response = await tavily_populate_culture(
+                    query=response.query,
+                    response=response,
+                    app_ctx=app_ctx
+                )
+                tools_executed.append("tavily_populate_culture")
+                if app_ctx:
+                    app_ctx.logger.info("Auto-executed tavily_populate_culture after companies_search")
+            except Exception as e:
+                logger.error(f"execute_tools: error auto-executing tavily_populate_culture: {e}")
 
     # Execute insights research tools
     if allow_insights:
@@ -314,10 +400,9 @@ app = MCPApp(
 async def career_agent(
     query: str,
     allow_jobs: bool = True,
+    allow_companies: bool = True,
     allow_insights: bool = True,
-    user_skills: list[str] | None = None,
     max_results: int = 20,
-    user_id: str = "anonymous",
     app_ctx: Optional[AppContext] = None
 ) -> dict:
     """
@@ -325,10 +410,9 @@ async def career_agent(
 
     Args:
         query: Search query (e.g., "python developer remote")
+        allow_companies: Find company emails from job listings
         allow_insights: Generate personalized skill gaps and action plan
-        user_skills: List of user's current skills for gap analysis
         max_results: Maximum total results to return
-        user_id: User identifier for personalization
         app_ctx: MCP context for logging and server access
     """
     start_time = time.time()
@@ -336,13 +420,13 @@ async def career_agent(
     if app_ctx:
         app_ctx.logger.info("Starting career_agent", data={"query": query})
 
-    user_context = UserContext(user_skills=user_skills or [])
+    user_context = UserContext(user_skills=[])
     response = Response(query=query)
 
     # Determine which tools to use based on user preferences
-    tool_selection = await choose_tools(query, user_context, allow_jobs, allow_insights, app_ctx)
+    tool_selection = await choose_tools(query, user_context, allow_jobs, allow_companies, allow_insights, app_ctx)
     response = await execute_tools(
-        tool_selection, user_context, max_results, user_id, allow_jobs, allow_insights, response, app_ctx
+        tool_selection, user_context, max_results, "anonymous", allow_jobs, allow_companies, allow_insights, response, app_ctx
     )
 
     response.metadata.execution_time_ms = int((time.time() - start_time) * 1000)
@@ -358,7 +442,6 @@ async def main():
         result = await career_agent(
             query="python developer",
             allow_insights=True,
-            user_skills=["python", "javascript", "sql"],
         )
         print(f"Result: {json.dumps(result, indent=2, default=str)}")
 
