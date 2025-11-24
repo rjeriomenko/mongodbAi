@@ -84,6 +84,7 @@ class Metadata(BaseModel):
     fresh_matches: int = 0
     historical_matches: int = 0
     database_documents_created: int = 0
+    database_documents_updated: int = 0
     insights_generated: bool = False
     tools_executed: list[str] = []
 
@@ -100,7 +101,6 @@ class Response(BaseModel):
     """Response payload from career_agent"""
     query: str
     search_terms: list[str] = []
-    tools_executed: list[str] = []
     jobs: list[Job] = []
     metadata: Metadata = Metadata()
     insights: InsightData | None = None

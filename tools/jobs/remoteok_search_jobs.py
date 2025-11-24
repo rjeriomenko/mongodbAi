@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import quote
 from urllib.request import urlopen, Request
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
 
 from pymongo import MongoClient, UpdateOne
 
@@ -23,7 +21,7 @@ logger = get_logger(__name__)
 
 
 def generate_embedding_http(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
-    """Generate embedding using Gemini REST API with urllib."""
+    """Generate embedding using Gemini REST API with urllib (sync version for query embedding)."""
     api_key = get_google_api_key()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}"
 
@@ -44,32 +42,55 @@ def generate_embedding_http(text: str, task_type: str = "RETRIEVAL_DOCUMENT") ->
         return result['embedding']['values']
 
 
-async def generate_embeddings(texts: list[str]) -> list[list[float]]:
-    """Generate embeddings for a list of texts using Gemini REST API in parallel."""
-    logger.info(f"generate_embeddings: generating for {len(texts)} texts in parallel")
+def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """Generate embeddings for multiple texts in a single batch API call."""
+    logger.info(f"generate_embeddings_batch: generating for {len(texts)} texts")
 
-    loop = asyncio.get_event_loop()
+    api_key = get_google_api_key()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={api_key}"
 
-    async def generate_one(text: str, index: int) -> list[float]:
-        try:
-            # Run blocking HTTP call in thread pool
-            embedding = await loop.run_in_executor(
-                None,
-                generate_embedding_http,
-                text,
-                "RETRIEVAL_DOCUMENT"
-            )
-            return embedding
-        except Exception as e:
-            logger.error(f"generate_embeddings: error for text {index}: {e}")
-            return [0.0] * 768
+    try:
+        # Build batch request with all texts
+        requests = []
+        for text in texts:
+            requests.append({
+                "model": "models/text-embedding-004",
+                "content": {"parts": [{"text": text}]},
+                "taskType": "RETRIEVAL_DOCUMENT"
+            })
 
-    # Generate all embeddings in parallel
-    tasks = [generate_one(text, i) for i, text in enumerate(texts)]
-    embeddings = await asyncio.gather(*tasks)
+        payload = {"requests": requests}
 
-    logger.info(f"generate_embeddings: completed {len(embeddings)} embeddings")
-    return list(embeddings)
+        req = Request(
+            url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={"Content-Type": "application/json"}
+        )
+
+        with urlopen(req, timeout=60) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+        # Extract embeddings from batch response
+        all_embeddings = []
+        embeddings_data = result.get('embeddings', [])
+
+        for i, emb_data in enumerate(embeddings_data):
+            embedding = emb_data.get('values', [0.0] * 768)
+            all_embeddings.append(embedding)
+
+        # Pad with zeros if some failed
+        while len(all_embeddings) < len(texts):
+            all_embeddings.append([0.0] * 768)
+
+        successful = sum(1 for emb in all_embeddings if emb[0] != 0.0)
+        logger.info(f"generate_embeddings_batch: completed {len(all_embeddings)} embeddings ({successful} successful)")
+        return all_embeddings
+
+    except Exception as e:
+        import traceback
+        logger.error(f"generate_embeddings_batch: error: {type(e).__name__}: {e}")
+        logger.error(f"generate_embeddings_batch: traceback: {traceback.format_exc()}")
+        return [[0.0] * 768 for _ in texts]
 
 
 def generate_query_embedding(query: str) -> list[float]:
@@ -90,14 +111,18 @@ def vector_search_jobs(collection, query_embedding: list[float], urls: list[str]
     job_type = "fresh" if is_fresh else "historical"
     filter_op = "$in" if is_fresh else "$nin"
 
-    logger.info(f"vector_search_jobs: searching for {limit} {job_type} jobs")
+    logger.info(f"vector_search_jobs: searching for {limit} {job_type} jobs, urls count: {len(urls)}")
 
     if is_fresh and not urls:
+        logger.info("vector_search_jobs: no URLs for fresh search, returning empty")
         return []
 
     try:
         url_filter = {filter_op: urls} if urls else {}
         filter_dict = {"url": url_filter} if url_filter else {}
+        logger.info(f"vector_search_jobs: filter_dict keys: {list(filter_dict.keys())}, has url filter: {'url' in filter_dict}")
+        if urls:
+            logger.info(f"vector_search_jobs: first url in filter: {urls[0][:80]}...")
 
         pipeline = [
             {
@@ -230,6 +255,7 @@ async def remoteok_search_jobs(
         raise
 
     docs_upserted = 0
+    docs_modified = 0
     historical_jobs: list[Job] = []
     fresh_jobs: list[Job] = []
     half_results = max_results // 2
@@ -242,36 +268,53 @@ async def remoteok_search_jobs(
         collection = db["career_results"]
 
         if fetched_jobs:
-            logger.info(f"remoteok_search_jobs: generating embeddings for {len(fetched_jobs)} jobs")
-            job_texts = [f"{job.title} at {job.company} - {job.location or ''}" for job in fetched_jobs]
-            job_embeddings = await generate_embeddings(job_texts)
+            # Check which jobs already exist in DB to skip embedding generation
+            existing_urls = set()
+            existing_docs = collection.find(
+                {"url": {"$in": fetched_urls}},
+                {"url": 1, "_id": 0}
+            )
+            for doc in existing_docs:
+                existing_urls.add(doc["url"])
 
-            operations = []
-            for job, embedding in zip(fetched_jobs, job_embeddings):
-                doc = {
-                    "query": query,
-                    "url": job.url,
-                    "title": job.title,
-                    "company": job.company,
-                    "source": job.source,
-                    "salary_min": job.salary_min,
-                    "salary_max": job.salary_max,
-                    "date_posted": job.date_posted,
-                    "location": job.location,
-                    "tags": job.tags,
-                    "user_id": user_id,
-                    "embedding": embedding,
-                    "updated_at": datetime.now(timezone.utc)
-                }
-                operations.append(UpdateOne(
-                    {"url": job.url},
-                    {"$set": doc, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
-                    upsert=True
-                ))
+            new_jobs = [job for job in fetched_jobs if job.url not in existing_urls]
+            logger.info(f"remoteok_search_jobs: {len(new_jobs)} new jobs to embed (skipping {len(existing_urls)} existing)")
 
-            logger.info(f"remoteok_search_jobs: upserting {len(operations)} jobs to MongoDB")
-            bulk_result = collection.bulk_write(operations)
-            docs_upserted = bulk_result.upserted_count
+            if new_jobs:
+                # Only generate embeddings for new jobs
+                job_texts = [f"{job.title} at {job.company} - {job.location or ''}" for job in new_jobs]
+                job_embeddings = generate_embeddings_batch(job_texts)
+
+                operations = []
+                for job, embedding in zip(new_jobs, job_embeddings):
+                    doc = {
+                        "query": query,
+                        "url": job.url,
+                        "title": job.title,
+                        "company": job.company,
+                        "source": job.source,
+                        "salary_min": job.salary_min,
+                        "salary_max": job.salary_max,
+                        "date_posted": job.date_posted,
+                        "location": job.location,
+                        "tags": job.tags,
+                        "user_id": user_id,
+                        "embedding": embedding,
+                        "updated_at": datetime.now(timezone.utc)
+                    }
+                    operations.append(UpdateOne(
+                        {"url": job.url},
+                        {"$set": doc, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
+                        upsert=True
+                    ))
+
+                logger.info(f"remoteok_search_jobs: upserting {len(operations)} new jobs to MongoDB")
+                bulk_result = collection.bulk_write(operations)
+                docs_upserted = bulk_result.upserted_count
+                docs_modified = bulk_result.modified_count
+                logger.info(f"remoteok_search_jobs: bulk_write result - upserted: {bulk_result.upserted_count}, modified: {bulk_result.modified_count}, matched: {bulk_result.matched_count}")
+            else:
+                logger.info("remoteok_search_jobs: all jobs already in DB, skipping embedding generation")
 
         logger.info(f"remoteok_search_jobs: running vector search for {half_results} results each")
         historical_jobs = vector_search_jobs(collection, query_embedding, fetched_urls, is_fresh=False, limit=half_results)
@@ -296,6 +339,7 @@ async def remoteok_search_jobs(
     response.metadata.fresh_matches = fresh_count
     response.metadata.historical_matches = historical_count
     response.metadata.database_documents_created = docs_upserted
+    response.metadata.database_documents_updated = docs_modified
 
     logger.info(f"remoteok_search_jobs: complete - {len(combined_jobs)} jobs ({fresh_count} fresh, {historical_count} historical)")
 
