@@ -1,3 +1,3 @@
-from tools.jobs import search_remoteok_jobs, search_jobs_tavily
+from tools.jobs import remoteok_search_jobs
 
-__all__ = ["search_remoteok_jobs", "search_jobs_tavily"]
+__all__ = ["remoteok_search_jobs"]

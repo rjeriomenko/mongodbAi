@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
 from typing import Any
 
+from pydantic import BaseModel, Field
 
-@dataclass
-class Job:
+
+class Job(BaseModel):
     """Represents a job listing from any source."""
 
     # Required fields
@@ -19,7 +19,7 @@ class Job:
     salary_max: int | None = None
     date_posted: str | None = None
     location: str | None = None
-    tags: list[str] = field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
 
     # Set after vector search
     score: float | None = None
@@ -27,11 +27,11 @@ class Job:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary, excluding None values for cleaner output."""
-        return {k: v for k, v in asdict(self).items() if v is not None}
+        return {k: v for k, v in self.model_dump().items() if v is not None}
 
     def to_mongo_doc(self) -> dict[str, Any]:
         """Convert to MongoDB document format (includes all fields)."""
-        return asdict(self)
+        return self.model_dump()
 
     @classmethod
     def from_mongo_doc(cls, doc: dict[str, Any]) -> Job:
